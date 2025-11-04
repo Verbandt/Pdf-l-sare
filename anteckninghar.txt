@@ -1,0 +1,6 @@
+Node 12-15 är alltid ingågnar
+Node 16-19 är alltid utgångar
+
+Ingånge data:Ha DI istälelt för X
+Koppla ihop ingågne med utgående, de har exakt samma kommentar
+Ta med vilken nod ingågen och uitgåendew är på.

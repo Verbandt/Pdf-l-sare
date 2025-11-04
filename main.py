@@ -11,5 +11,5 @@ visualizer = PdfVisualizer(scheme_to_use)
 viewer = PdfCoordinateViewer(scheme_to_use)
 extractor = PdfMultiRegionExtractor(scheme_to_use)
 
-# viewer.view_page(page_number=1)
-df = extractor.extract()
+viewer.view_page(page_number=1)
+# df = extractor.extract()
