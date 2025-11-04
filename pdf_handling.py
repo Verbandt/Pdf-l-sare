@@ -178,7 +178,7 @@ class PdfMultiRegionExtractor:
 
     def __init__(self, pdf_path: str):
         self.pdf_path = Path(pdf_path)
-        self.groups = self.load_groups_from_json("outputs.json")
+        self.groups = self.load_groups_from_json("inputs.json")
 
     # ---------------------------------------------------------
     def extract(self):
