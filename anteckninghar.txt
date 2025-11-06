@@ -4,3 +4,7 @@ Node 16-19 är alltid utgångar
 Ingånge data:Ha DI istälelt för X
 Koppla ihop ingågne med utgående, de har exakt samma kommentar
 Ta med vilken nod ingågen och uitgåendew är på.
+
+
+25.11.06:
+ingångarna kan vara S11-S16 / R11-R16 eller något annat. får bli en funtion att mata in filter
