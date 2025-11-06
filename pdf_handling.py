@@ -25,95 +25,168 @@ class PdfHandler:
         return words
 
     def word_similarity_score(self, words_a: list[str], words_b: list[str]) -> float:
-        """Return overlap ratio between two word lists, allowing small typos."""
+        """Return a symmetric word-based similarity ratio (0–1)."""
         if not words_a or not words_b:
             return 0.0
 
-        matched = 0
-        for wa in words_a:
-            # direct match or near match
-            for wb in words_b:
-                if wa == wb:
-                    matched += 1
-                    break
-                # allow one-letter typo (>=0.85 similarity)
-                if SequenceMatcher(None, wa, wb).ratio() >= 0.85:
-                    matched += 1
-                    break
+        # direct word overlap (case-insensitive)
+        overlap = sum(1 for w in words_a if w in words_b)
+        ratio_a = overlap / len(words_a)
+        ratio_b = overlap / len(words_b)
 
-        max_len = max(len(words_a), len(words_b))
-        return matched / max_len
+        # symmetric: both must share words in similar proportion
+        return (ratio_a + ratio_b) / 2
 
     def pair_inputs_outputs(self, threshold: float = 0.8):
         df = self.df
         matched_nodes, unmatched_inputs, unmatched_outputs = [], [], []
 
-        inputs_df = df[df["Role"] == "Input"].copy()
-        outputs_df = df[df["Role"] == "Output"].copy()
+        inputs_df = df[df["Role"].str.lower() == "input"].copy()
+        outputs_df = df[df["Role"].str.lower() == "output"].copy()
 
-        # --- Parse Inputs ---
+
+        # --------------------------------------------------------
+        # Helper functions
+        # --------------------------------------------------------
+        def normalize_words(text: str) -> list[str]:
+            text = re.sub(r'[^a-zA-Z0-9]+', ' ', text.lower())
+            return text.split()
+
+        def similar(a: str, b: str) -> bool:
+            """Fuzzy comparison for near-identical words."""
+            return SequenceMatcher(None, a, b).ratio() >= 0.85
+
+        def word_similarity_score(words_a: list[str], words_b: list[str]) -> float:
+            """Symmetric overlap score: both sides must share similar words."""
+            if not words_a or not words_b:
+                return 0.0
+            overlap = 0
+            for wa in words_a:
+                for wb in words_b:
+                    if wa == wb or similar(wa, wb):
+                        overlap += 1
+                        break
+            ratio_a = overlap / len(words_a)
+            ratio_b = overlap / len(words_b)
+            return min(ratio_a, ratio_b)  # strict — must match both ways
+
+        # --------------------------------------------------------
+        # Parse Inputs
+        # --------------------------------------------------------
         input_nodes = []
         for _, row in inputs_df.iterrows():
             parts = [p.strip() for p in row["Extracted Text"].split(",")]
             if len(parts) < 2:
                 continue
-            input_name = parts[0]  # e.g. "DI 10"
-            match_text = parts[1]  # e.g. "CYLINDER GUIDEPIN HOOD INNER CPL RESET"
+
+            page_num = row["Page"]
+            node_number = self.extractor.pages.get(page_num, {}).get("node", None)
+
             input_nodes.append({
-                "input_name": input_name,
-                "input_page": row["Page"],
-                "match_text": match_text,
-                "words": self.normalize_words(match_text),
+                "input_name": parts[0],  # e.g. "DI 10"
+                "match_text": parts[1],  # e.g. "CYLINDER GUIDEPIN HOOD INNER CPL RESET"
+                "node_number": node_number,  # ✅ from assign_pages_per_node
+                "words": normalize_words(parts[1]),
             })
 
-        # --- Parse Outputs ---
+        # --------------------------------------------------------
+        # Parse Outputs
+        # --------------------------------------------------------
         output_nodes = []
         for _, row in outputs_df.iterrows():
             words = row["Extracted Text"].split()
             if len(words) < 2:
                 continue
-            output_name = words[0]
+
+            output_name = words[0]  # e.g. "314Y11R"
             match_text = " ".join(words[1:])
+
+            # --- Extract output number from "Group" (e.g. "output 5") ---
+            output_number = None
+            group_name = str(row.get("Group", "")).strip().lower()
+            match = re.search(r"output\s*(\d+)", group_name)
+            if match:
+                output_number = int(match.group(1))  # ✅ e.g. 5
+
+            # --- Determine action type (set/reset) ---
+            if output_name.endswith("S"):
+                action_type = "set"
+            elif output_name.endswith("R"):
+                action_type = "reset"
+            else:
+                action_type = None
+
+            node_number = row["Node"]
+
             output_nodes.append({
                 "output_name": output_name,
-                "output_page": row["Page"],
+                "output_number": output_number,  # ✅ now from group name
                 "match_text": match_text,
-                "words": self.normalize_words(match_text),
+                "node_number": node_number,
+                "action_type": action_type,
+                "words": normalize_words(match_text),
             })
 
-        # --- Match Inputs to Outputs ---
-        used_outputs = set()
-        for inp in input_nodes:
-            best_match = None
-            best_score = 0.0
+        # --------------------------------------------------------
+        # Match Inputs → Outputs
+        # --------------------------------------------------------
+        matched_input_names = set()
+        matched_output_names = set()
 
-            for out in output_nodes:
-                if out["output_name"] in used_outputs:
-                    continue
-
-                score = self.word_similarity_score(inp["words"], out["words"])
-                if score > best_score:
-                    best_score = score
-                    best_match = out
-
-            if best_match and best_score >= threshold:
-                matched_nodes.append({
-                    "Input Name": inp["input_name"],
-                    "Output Name": best_match["output_name"],
-                    "Shared Text": inp["match_text"],
-                    "Input Page": inp["input_page"],
-                    "Output Page": best_match["output_page"],
-                    "Word Match %": round(best_score * 100, 1)
-                })
-                used_outputs.add(best_match["output_name"])
-            else:
-                unmatched_inputs.append(inp)
-
-        # --- Remaining unmatched outputs ---
         for out in output_nodes:
-            if out["output_name"] not in used_outputs:
+            matched_inputs_for_output = []
+
+            for inp in input_nodes:
+                inp_text = " ".join(inp["words"])
+
+                # --- Safe, word-aware SET/RESET filtering ---
+                has_set = re.search(r"\bset\b", inp_text)
+                has_reset = re.search(r"\breset\b", inp_text)
+
+                if out["action_type"] == "set":
+                    if not has_set or has_reset:
+                        continue
+                elif out["action_type"] == "reset":
+                    if not has_reset or has_set:
+                        continue
+
+                # --- Compute symmetric similarity ---
+                score = word_similarity_score(inp["words"], out["words"])
+                if score >= threshold:
+                    matched_inputs_for_output.append({
+                        "Input Name": inp["input_name"],
+                        "Input Node": inp["node_number"],
+                        "Similarity %": round(score * 100, 1),
+                    })
+                    matched_input_names.add(inp["input_name"])
+                    matched_output_names.add(out["output_name"])
+
+            # --- Record one row per output, with all matching inputs ---
+            if matched_inputs_for_output:
+                input_names = ", ".join(f"{i['Input Name']} ({i['Similarity %']}%)" for i in matched_inputs_for_output)
+                input_nodes_str = ", ".join(str(i["Input Node"]) for i in matched_inputs_for_output)
+
+                matched_nodes.append({
+                    "Output Name": out["output_name"],
+                    "Output Number": out["output_number"],
+                    "Action Type": out["action_type"] or "",
+                    "Shared Text": out["match_text"],
+                    "Matched Inputs": input_names,
+                    "Connection": f"Node_{input_nodes_str} → Node_{out['node_number']}",
+                })
+            else:
                 unmatched_outputs.append(out)
 
+        # --------------------------------------------------------
+        # Unmatched Inputs
+        # --------------------------------------------------------
+        for inp in input_nodes:
+            if inp["input_name"] not in matched_input_names:
+                unmatched_inputs.append(inp)
+
+        # --------------------------------------------------------
+        # Save Results
+        # --------------------------------------------------------
         self.matched_nodes = pd.DataFrame(matched_nodes)
         self.unmatched_inputs = pd.DataFrame(unmatched_inputs)
         self.unmatched_outputs = pd.DataFrame(unmatched_outputs)
@@ -196,14 +269,17 @@ class PdfMultiRegionExtractor:
         self.extracted_words = {}  # structured positional data — each word with coordinates.
 
         self.extract_info_from_pdf()
-        self.pages: [int, str] = self.assign_pages_per_node()
+        self.pages: dict[int, dict[str, str | int]] = self.assign_pages_per_node()
 
     # ---------------------------------------------------------
     def extract_groups(self) -> pd.DataFrame:
         results = []
 
         # iterate only classified pages
-        for page_num, role in self.pages.items():
+        for page_num, info in self.pages.items():
+            role = info.get("role")
+            node_number = info.get("node")
+
             if role not in ("Input", "Output"):
                 continue
 
@@ -234,7 +310,8 @@ class PdfMultiRegionExtractor:
                 if box_texts:
                     results.append({
                         "Page": page_num,
-                        "Role": role,
+                        "Role": role,  # ✅ now a real string
+                        "Node": node_number,  # ✅ preserved from self.pages
                         "Group": group["name"],
                         "Boxes": len(group["boxes"]),
                         "Extracted Text": ", ".join(box_texts)
@@ -277,16 +354,19 @@ class PdfMultiRegionExtractor:
 
         for page_num, text in self.extracted_text.items():
             match = re.search(r"Nod:(\d+)", text)
-
             if not match:
                 continue
 
-            nod_value = int(match.group(1))
+            node_value = int(match.group(1))
 
-            if nod_value in self.input_node_range:
-                page_roles[page_num] = "Input"
-            elif nod_value in self.output_node_range:
-                page_roles[page_num] = "Output"
+            if node_value in self.input_node_range:
+                role = "Input"
+            elif node_value in self.output_node_range:
+                role = "Output"
+            else:
+                role = "Other"
+
+            page_roles[page_num] = {"role": role, "node": node_value}
 
         return page_roles
 
